@@ -1,0 +1,111 @@
+From c9f2a3fc08ab5a508fa5f42ef9e1b8ddeaa26c0c Mon Sep 17 00:00:00 2001
+From: "James P. Harvey" <jamespharvey20@gmail.com>
+Date: Fri, 19 Aug 2016 23:52:41 -0400
+Subject: [PATCH] Initial work on closing SRP connection
+
+---
+ src/drivers/block/srp.c     | 59 +++++++++++++++++++++++++++++++++++++++++++++
+ src/net/infiniband/ib_srp.c |  1 +
+ 2 files changed, 60 insertions(+)
+
+diff --git a/src/drivers/block/srp.c b/src/drivers/block/srp.c
+index 85c7aa8..8ab4a97 100644
+--- a/src/drivers/block/srp.c
++++ b/src/drivers/block/srp.c
+@@ -229,15 +229,33 @@ static void srpcmd_close ( struct srp_command *srpcmd, int rc ) {
+  * @v srpdev		SRP device
+  * @v rc		Reason for close
+  */
++static int srp_new_tag ( struct srp_device *srpdev );
++static int srp_initiator_logout ( struct srp_device *srpdev, uint32_t tag );
+ static void srpdev_close ( struct srp_device *srpdev, int rc ) {
+ 	struct srp_command *srpcmd;
+ 	struct srp_command *tmp;
+ 
++	dbg_printf ( "!srpdev_close()\n" );
+ 	if ( rc != 0 ) {
+ 		DBGC ( srpdev, "SRP %p closed: %s\n",
+ 		       srpdev, strerror ( rc ) );
+ 	}
+ 
++	/* If logged in, attempt logging out */
++	if ( srpdev->logged_in ) {
++		dbg_printf ( "!srpdev->logged_in true\n" );
++		int logout_rc;
++		int tag;
++
++		tag = srp_new_tag ( srpdev );
++		if ( tag < 0 )
++			DBGC ( srpdev, "SRP %p tag %08x invalid tag\n", srpdev, tag );
++		else if ( ( logout_rc = srp_initiator_logout ( srpdev, tag ) ) != 0 )
++			DBGC ( srpdev, "SRP %p tag %08x cannot logout\n", srpdev, tag );
++	} else {
++		dbg_printf ( "!srpdev->logged_in false\n" );
++	}
++
+ 	/* Shut down interfaces */
+ 	intf_shutdown ( &srpdev->socket, rc );
+ 	intf_shutdown ( &srpdev->scsi, rc );
+@@ -393,6 +411,47 @@ static int srp_login_rej ( struct srp_device *srpdev,
+ }
+ 
+ /**
++ * Transmit SRP initiator logout
++ *
++ * @v srpdev		SRP device
++ * @v tag		Command tag
++ * @ret rc		Return status code
++ */
++static int srp_initiator_logout ( struct srp_device *srpdev, uint32_t tag ) {
++	struct io_buffer *iobuf;
++	struct srp_i_logout *i_logout;
++	int rc;
++
++	/* Allocate I/O buffer */
++	iobuf = xfer_alloc_iob ( &srpdev->socket, sizeof ( *i_logout ) );
++	if ( ! iobuf )
++		return -ENOMEM;
++
++	/* Construct initiator logout IU */
++	i_logout = iob_put ( iobuf, sizeof ( *i_logout ) );
++	memset ( i_logout, 0, sizeof ( *i_logout ) );
++	i_logout->type = SRP_I_LOGOUT;
++	i_logout->tag.dwords[0] = htonl ( SRP_TAG_MAGIC );
++	i_logout->tag.dwords[1] = htonl ( tag );
++
++	DBGC ( srpdev, "SRP %p tag %08x I_LOGOUT:\n", srpdev, tag );
++	DBGC_HDA ( srpdev, 0, iobuf->data, iob_len ( iobuf ) );
++
++	/* Send initiator logout IU */
++	if ( ( rc = xfer_deliver_iob ( &srpdev->socket, iobuf ) ) != 0 ) {
++		DBGC ( srpdev, "SRP %p tag %08x could not send I_LOGOUT: "
++		       "%s\n", srpdev, tag, strerror ( rc ) );
++		return rc;
++	}
++
++	/* Mark as logged out */
++	srpdev->logged_in = 0;
++	DBGC ( srpdev, "SRP %p logged out\n", srpdev );
++
++	return 0;
++}
++
++/**
+  * Transmit SRP SCSI command
+  *
+  * @v srpdev		SRP device
+diff --git a/src/net/infiniband/ib_srp.c b/src/net/infiniband/ib_srp.c
+index 904a99b..2c718ef 100644
+--- a/src/net/infiniband/ib_srp.c
++++ b/src/net/infiniband/ib_srp.c
+@@ -106,6 +106,7 @@ static void ib_srp_free ( struct refcnt *refcnt ) {
+  * @v rc		Reason for close
+  */
+ static void ib_srp_close ( struct ib_srp_device *ib_srp, int rc ) {
++	dbg_printf ("ib_srp_close\n" );
+ 	/* Shut down interfaces */
+ 	intf_shutdown ( &ib_srp->cmrc, rc );
+ 	intf_shutdown ( &ib_srp->srp, rc );
+-- 
+2.9.0
+
