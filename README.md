@@ -16,8 +16,8 @@ Based on the sBFT specification available at: http://etherboot.org/wiki/srp/sbft
 
 Successfully boots from an SRP volume using:
 * iPXE
-** Git commit 2afd66eb
-** With ipxe/fix_sbft_endian.patch
+  * Git commit 2afd66eb
+  * With ipxe/fix_sbft_endian.patch
 * srp-boot (https://github.com/jamespharvey20/srp-boot)
 * (2) Mellanox ConnectX-2 MT26428, using 2.9.1000 firmware
 * Target: Arch Linux, with kernel < 4.7
