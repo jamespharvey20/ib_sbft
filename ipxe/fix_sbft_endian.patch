@@ -1,0 +1,169 @@
+From 5c404cef5319d1f26fe072817b627623eab0b509 Mon Sep 17 00:00:00 2001
+From: "James P. Harvey" <jamespharvey20@gmail.com>
+Date: Mon, 15 Aug 2016 23:28:42 -0400
+Subject: [PATCH] Fixed endian problems in sBFT.  Documented bug in
+ scsi_parse_lun.
+
+---
+ src/drivers/block/scsi.c    | 21 +++++++++++++++++++++
+ src/drivers/block/srp.c     | 17 ++++++++++++-----
+ src/include/byteswap.h      | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ src/net/infiniband/ib_srp.c | 13 ++++++++-----
+ 4 files changed, 85 insertions(+), 10 deletions(-)
+
+diff --git a/src/drivers/block/scsi.c b/src/drivers/block/scsi.c
+index fd5f82b..3212a01 100644
+--- a/src/drivers/block/scsi.c
++++ b/src/drivers/block/scsi.c
+@@ -122,6 +122,27 @@ int scsi_parse_lun ( const char *lun_string, struct scsi_lun *lun ) {
+ 	if ( lun_string ) {
+ 		p = ( char * ) lun_string;
+ 		for ( i = 0 ; i < 4 ; i++ ) {
++			// BUG
++			// strtoul returns an unsigned long (at least 32 bits, 64 bits on most *nix)
++			//    if its first argument is larger than ULONG_MAX, it returns ULONG_MAX
++			//    and sets errno to ERANGE.  Its second paramater is for poining to the
++			//    next character which is not a valid digit in the given base, it isn't
++			//    for chaining multiple strtoul calls to parse a larger number.  Since
++			//    strtoul can legitimately return ULONG_MAX, calling code should set
++			//    errno to 0, then compare it to ERANGE after.
++			// Here, htons takes a uint32_t (also a uint16_t version), so with 64 bit
++			//    long, the most significant bits are discarded.
++			// When htons is given a uint32_t, it returns a uint32_t, but its result is
++			//    assigned to a uint16_t, discarding the most significant bits.
++			// In the end, only stores either 1/2 or 1/4 of the least significant bits.
++			// Given an only-digit lun_string, *p will always be '\0', so the loop only
++			//    runs once, and only lun->u16[0] will be set.
++			// Also, if only this is fixed, each u16 will internally use cpu-endian, but
++			//    the u16's would sequentially be in network endian, making lun as a whole
++			//    be a mixed endian structure on little endian cpus.
++			// If any of this is ever fixed, src/drivers/block/srp.c::srpdev_describe()
++			//    must be updated to also use lun->u16[1-3] AND handle whatever endianess
++			//    winds up being used.
+ 			lun->u16[i] = htons ( strtoul ( p, &p, 16 ) );
+ 			if ( *p == '\0' )
+ 				break;
+diff --git a/src/drivers/block/srp.c b/src/drivers/block/srp.c
+index 7edf69a..85c7aa8 100644
+--- a/src/drivers/block/srp.c
++++ b/src/drivers/block/srp.c
+@@ -717,17 +717,24 @@ static int srpdev_describe ( struct srp_device *srpdev,
+ 
+ 	/* Populate table */
+ 	sbft->table.acpi.signature = cpu_to_le32 ( SBFT_SIG );
++	/* Set length assuming no IB Subtable.  If there is one, */
++	/* ib_srp_describe() increases. */
+ 	sbft->table.acpi.length = cpu_to_le32 ( sizeof ( *sbft ) );
++	/* Only one byte, no endianness */
+ 	sbft->table.acpi.revision = 1;
+ 	sbft->table.scsi_offset =
+ 		cpu_to_le16 ( offsetof ( typeof ( *sbft ), scsi ) );
+-	memcpy ( &sbft->scsi.lun, &srpdev->lun, sizeof ( sbft->scsi.lun ) );
++	/* See BUG note in src/drivers/block/scsi.c::scsi_parse_lun() */
++	/* srpdev->lun only uses u16[0].  If that is ever fixed, then a new copy */
++	/* function will be needed, copy_ne_u16_to_le_u16_array will be wrong */
++	copy_ne_u16_to_le_u16_array ( sbft->scsi.lun.u16, srpdev->lun.u16[0],
++		sizeof ( sbft->scsi.lun ) );
+ 	sbft->table.srp_offset =
+ 		cpu_to_le16 ( offsetof ( typeof ( *sbft ), srp ) );
+-	memcpy ( &sbft->srp.initiator, &srpdev->initiator,
+-		 sizeof ( sbft->srp.initiator ) );
+-	memcpy ( &sbft->srp.target, &srpdev->target,
+-		 sizeof ( sbft->srp.target ) );
++	copy_ne_to_le_u8_array ( sbft->srp.initiator.bytes, srpdev->initiator.bytes,
++		sizeof ( sbft->srp.initiator ) );
++	copy_ne_to_le_u8_array ( sbft->srp.target.bytes, srpdev->target.bytes,
++		sizeof ( sbft->srp.target ) );
+ 
+ 	/* Ask transport layer to describe transport-specific portions */
+ 	if ( ( rc = acpi_describe ( &srpdev->socket, acpi, len ) ) != 0 ) {
+diff --git a/src/include/byteswap.h b/src/include/byteswap.h
+index d1028c5..9fc2177 100644
+--- a/src/include/byteswap.h
++++ b/src/include/byteswap.h
+@@ -135,4 +135,48 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
+ #define htons( value ) cpu_to_be16 (value)
+ #define ntohs( value ) be16_to_cpu (value)
+ 
++/**
++ * Copy an array of u8's seen as a network endian larger bit variable to an
++ *    array of u8's seen as a little endian larger bit variable
++ *
++ * Example: A string "12345678" would be parsed by ib_srp_parse_byte_string into
++ *    a uint8_t bytes[4] as: { 12 34 56 78 }.
++ *    Given such uint8_t[], this would return:
++ *    { 78 56 34 12 } (which as a whole little endian uint32_t is 0x12345678)
++ *
++ * @v dest    Destination u8 array
++ * @v src     Source u8 array
++ * @v len     Length of each u8 array (they must be the same length)
++ */
++#define copy_ne_to_le_u8_array( dest, src, size )  \
++   for ( unsigned int i = 0 ; i < size ; i++) { \
++      dest[i] = src[size-1-i];                  \
++   }
++
++/**
++ * Copy a network endian u16 to an array of u16's seen as a little endian u64
++ * This is necessitated by a bug in src/drivers/block/scsi.c::scsi_parse_lun()
++ *
++ * Example: A string "1234" would be parsed into a scsi_lun.u16[0] as: { 12 34 }.
++ *    Given such scsi_lun.u16[0], this will return:
++ *    { 34 12 00 00 00 00 00 00 } (which as a whole little endian uint64_t is 0x1234)
++ *
++ * @v dest    Destination u16 array
++ * @v src     Source u16 (singular)
++ * @v len     Length of destination u16 array
++ */
++// If CPU is little endian, use ntohs to convert network endian to little endian
++#if __BYTE_ORDER == __LITTLE_ENDIAN
++#define copy_ne_u16_to_le_u16_array( dest, src, size )  \
++   memset ( dest, 0, sizeof ( *dest ) );        \
++   dest[0] = ntohs(src);
++#endif
++
++// If CPU is big endian, use cpu_to_le16 to convert network endian to little endian
++#if __BYTE_ORDER == __BIG_ENDIAN
++#define copy_ne_u16_to_le_u16_array( dest, src, size )  \
++   memset ( dest, 0, sizeof ( *dest ) );        \
++   dest[0] = cpu_to_le16(src);
++#endif
++
+ #endif /* BYTESWAP_H */
+diff --git a/src/net/infiniband/ib_srp.c b/src/net/infiniband/ib_srp.c
+index 3b4914a..904a99b 100644
+--- a/src/net/infiniband/ib_srp.c
++++ b/src/net/infiniband/ib_srp.c
+@@ -106,7 +106,6 @@ static void ib_srp_free ( struct refcnt *refcnt ) {
+  * @v rc		Reason for close
+  */
+ static void ib_srp_close ( struct ib_srp_device *ib_srp, int rc ) {
+-
+ 	/* Shut down interfaces */
+ 	intf_shutdown ( &ib_srp->cmrc, rc );
+ 	intf_shutdown ( &ib_srp->srp, rc );
+@@ -140,13 +139,17 @@ static int ib_srp_describe ( struct ib_srp_device *ib_srp,
+ 	used += sizeof ( *ib_sbft );
+ 	if ( used > len )
+ 		return -ENOBUFS;
++	/* Making UB Subtable, so increase length for entire sBFT */
+ 	sbft->acpi.length = cpu_to_le32 ( used );
+ 
+ 	/* Populate subtable */
+-	memcpy ( &ib_sbft->sgid, &ibdev->gid, sizeof ( ib_sbft->sgid ) );
+-	memcpy ( &ib_sbft->dgid, &ib_srp->dgid, sizeof ( ib_sbft->dgid ) );
+-	memcpy ( &ib_sbft->service_id, &ib_srp->service_id,
+-		 sizeof ( ib_sbft->service_id ) );
++	copy_ne_to_le_u8_array ( ib_sbft->sgid.bytes, ibdev->gid.bytes,
++		sizeof ( ib_sbft->sgid ) );
++	copy_ne_to_le_u8_array ( ib_sbft->dgid.bytes, ib_srp->dgid.bytes,
++		sizeof ( ib_sbft->dgid ) );
++	copy_ne_to_le_u8_array ( ib_sbft->service_id.bytes, ib_srp->service_id.bytes,
++		sizeof ( ib_sbft->service_id ) );
++
+ 	ib_sbft->pkey = cpu_to_le16 ( ibdev->pkey );
+ 
+ 	return 0;
+-- 
+2.9.0
+
